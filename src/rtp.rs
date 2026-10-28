@@ -122,6 +122,9 @@ pub struct PortPool {
 
 pub struct RtpSocket {
     pub socket: UdpSocket,
+    /// RTCP on port+1. Received reports are drained and ignored; having the socket bound
+    /// stops the far end from getting ICMP port-unreachable for every report.
+    pub rtcp: Option<UdpSocket>,
     pub port: u16,
     pool: PortPool,
 }
@@ -135,12 +138,14 @@ impl Drop for RtpSocket {
 impl PortPool {
     pub fn new(min: u16, max: u16) -> Self {
         let start = min + (min % 2);
-        let free = (start..=max).step_by(2).collect();
+        let free = (start..max).step_by(2).collect();
         PortPool { free: Arc::new(Mutex::new(free)) }
     }
 
     pub async fn bind(&self, ip: IpAddr) -> std::io::Result<RtpSocket> {
-        // Try a bounded number of ports; some may be busy with other processes.
+        // Ports busy in another process are put back afterwards rather than leaked.
+        let mut busy = Vec::new();
+        let mut result = Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, "no free RTP ports"));
         for _ in 0..64 {
             let port = {
                 let mut free = self.free.lock().unwrap();
@@ -153,14 +158,16 @@ impl PortPool {
                 pick
             };
             match UdpSocket::bind(SocketAddr::new(ip, port)).await {
-                Ok(socket) => return Ok(RtpSocket { socket, port, pool: self.clone() }),
-                Err(_) => {
-                    // Keep it out of the pool for now; it's in use elsewhere.
-                    continue;
+                Ok(socket) => {
+                    let rtcp = UdpSocket::bind(SocketAddr::new(ip, port + 1)).await.ok();
+                    result = Ok(RtpSocket { socket, rtcp, port, pool: self.clone() });
+                    break;
                 }
+                Err(_) => busy.push(port),
             }
         }
-        Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, "no free RTP ports"))
+        self.free.lock().unwrap().extend(busy);
+        result
     }
 }
 

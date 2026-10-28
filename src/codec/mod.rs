@@ -130,18 +130,62 @@ impl Transcoder {
         Ok(())
     }
 
-    /// Conceals one lost packet (Opus PLC, silence for G.711).
-    pub fn conceal(&mut self, out: &mut Vec<i16>) {
-        let n = self.frame_samples();
+    /// RTP clock units → PCM samples at the WS rate.
+    pub fn clock_to_pcm(&self, dur: u32, clock: u32) -> usize {
+        (dur as u64 * self.pcm_rate as u64 / clock as u64) as usize
+    }
+
+    /// Conceals `n` samples of lost audio (Opus PLC; G.711 silence through the resampler).
+    pub fn conceal(&mut self, n: usize, out: &mut Vec<i16>) {
         match &mut self.inner {
             Inner::Opus { dec, .. } => {
-                self.scratch.resize(n, 0);
-                match dec.decode(&[], &mut self.scratch, false) {
-                    Ok(got) => out.extend_from_slice(&self.scratch[..got]),
-                    Err(_) => out.extend(std::iter::repeat_n(0, n)),
+                // PLC works in multiples of 2.5 ms, at most 120 ms per call.
+                let step = (self.pcm_rate / 400) as usize;
+                let mut left = n;
+                while left >= step {
+                    let chunk = left.min(step * 8 * 6) / step * step; // ≤ 120 ms
+                    self.scratch.resize(chunk, 0);
+                    match dec.decode(&[], &mut self.scratch, false) {
+                        Ok(got) => out.extend_from_slice(&self.scratch[..got]),
+                        Err(_) => out.extend(std::iter::repeat_n(0, chunk)),
+                    }
+                    left -= chunk;
                 }
+                out.extend(std::iter::repeat_n(0, left));
             }
-            Inner::G711 { .. } => out.extend(std::iter::repeat_n(0, n)),
+            Inner::G711 { .. } => self.silence(n, out),
+        }
+    }
+
+    /// Recovers a lost frame of `n` samples from the in-band FEC carried by the next packet.
+    pub fn decode_fec(&mut self, next: &[u8], n: usize, out: &mut Vec<i16>) -> bool {
+        let Inner::Opus { dec, .. } = &mut self.inner else { return false };
+        if n == 0 || n > self.pcm_rate as usize * 120 / 1000 {
+            return false;
+        }
+        self.scratch.resize(n, 0);
+        match dec.decode(next, &mut self.scratch, true) {
+            Ok(got) if got == n => {
+                out.extend_from_slice(&self.scratch[..got]);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `n` samples of sender-side silence.
+    pub fn silence(&mut self, n: usize, out: &mut Vec<i16>) {
+        match &mut self.inner {
+            Inner::Opus { .. } => out.extend(std::iter::repeat_n(0, n)),
+            Inner::G711 { ulaw, up, .. } => {
+                // Feed coded silence through the resampler so its state stays continuous.
+                let n8 = n * 8000 / self.pcm_rate as usize;
+                let zero = if *ulaw { 0xFF } else { 0xD5 };
+                self.scratch.clear();
+                let dec = if *ulaw { g711::ulaw_to_linear(zero) } else { g711::alaw_to_linear(zero) };
+                self.scratch.extend(std::iter::repeat_n(dec, n8));
+                up.process(&self.scratch, out);
+            }
         }
     }
 
@@ -185,8 +229,11 @@ mod tests {
             let mut out = Vec::new();
             t.decode(&pkt, &mut out).unwrap();
             assert_eq!(out.len(), t.frame_samples());
-            t.conceal(&mut out);
-            assert_eq!(out.len(), 2 * t.frame_samples());
+            let n = t.frame_samples();
+            t.conceal(n, &mut out);
+            assert_eq!(out.len(), 2 * n);
+            assert!(t.decode_fec(&pkt, n, &mut out));
+            assert_eq!(out.len(), 3 * n);
         }
     }
 

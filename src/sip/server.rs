@@ -523,7 +523,10 @@ impl SipServer {
     fn renegotiate(&self, d: &Dialog, req: &SipMessage) -> Result<String> {
         let offer = Sdp::parse(&req.body)?;
         let neg = offer.negotiate(&[d.codec])?;
-        let _ = d.media_tx.send(MediaCtl::RemoteAddr(SocketAddr::new(neg.remote_ip, neg.remote_port)));
+        let _ = d.media_tx.send(MediaCtl::Remote {
+            addr: SocketAddr::new(neg.remote_ip, neg.remote_port),
+            direction: neg.direction,
+        });
         let version = {
             let mut g = d.inner.lock().unwrap();
             g.sdp_version += 1;

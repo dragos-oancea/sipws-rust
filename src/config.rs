@@ -13,6 +13,23 @@ pub enum Endian {
     Be,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum WsFormat {
+    /// Raw 16-bit linear PCM, mono.
+    L16,
+    /// Ogg-encapsulated Opus (RFC 7845), one Ogg page per binary message.
+    OggOpus,
+}
+
+impl WsFormat {
+    pub fn name(self) -> &'static str {
+        match self {
+            WsFormat::L16 => "L16",
+            WsFormat::OggOpus => "ogg/opus",
+        }
+    }
+}
+
 /// SIP/RTP media server that bridges each call to a WebSocket carrying
 /// JSON-RPC 2.0 control messages and binary L16 audio frames.
 #[derive(Debug, Clone, Parser)]
@@ -57,8 +74,34 @@ pub struct Config {
     pub ws_sample_rate: u32,
 
     /// Duration of each binary frame sent to the WebSocket, in ms.
+    /// (For ogg-opus: audio duration collected into each Ogg page.)
     #[arg(long, env = "SIPWS_WS_FRAME_MS", default_value_t = 20)]
     pub ws_frame_ms: u32,
+
+    /// Audio format sent to the WebSocket app.
+    #[arg(long, env = "SIPWS_WS_OUT_FORMAT", value_enum, default_value_t = WsFormat::L16)]
+    pub ws_out_format: WsFormat,
+
+    /// Audio format the WebSocket app sends back for playback.
+    #[arg(long, env = "SIPWS_WS_IN_FORMAT", value_enum, default_value_t = WsFormat::L16)]
+    pub ws_in_format: WsFormat,
+
+    /// In ogg-opus output, copy Opus packets from RTP straight into Ogg when the call uses Opus
+    /// (no decode/re-encode). With false, or for G.711 calls, audio is (re)encoded.
+    #[arg(long, env = "SIPWS_OGG_PASSTHROUGH", default_value_t = true, action = clap::ArgAction::Set)]
+    pub ogg_passthrough: bool,
+
+    /// Opus bitrate (bit/s) when sipws encodes the ogg-opus stream itself.
+    #[arg(long, env = "SIPWS_OGG_BITRATE", default_value_t = 32000)]
+    pub ogg_bitrate: i32,
+
+    /// Jitter buffer target delay, ms. Playout starts once this much audio is queued.
+    #[arg(long, env = "SIPWS_JITTER_TARGET_MS", default_value_t = 60)]
+    pub jitter_target_ms: u32,
+
+    /// Jitter buffer hard limit, ms; older audio is discarded beyond it.
+    #[arg(long, env = "SIPWS_JITTER_MAX_MS", default_value_t = 500)]
+    pub jitter_max_ms: u32,
 
     /// Byte order of L16 samples on the WebSocket.
     #[arg(long, env = "SIPWS_WS_ENDIAN", value_enum, default_value_t = Endian::Le)]
@@ -98,6 +141,12 @@ impl Config {
         }
         if self.ws_frame_ms == 0 || self.ws_frame_ms > 1000 {
             bail!("--ws-frame-ms must be 1..=1000");
+        }
+        if self.jitter_target_ms > 1000 || self.jitter_max_ms > 5000 {
+            bail!("jitter buffer limits too large (target <= 1000 ms, max <= 5000 ms)");
+        }
+        if !(6000..=510_000).contains(&self.ogg_bitrate) {
+            bail!("--ogg-bitrate must be 6000..=510000");
         }
         if self.rtp_port_min >= self.rtp_port_max {
             bail!("empty RTP port range");

@@ -1,9 +1,4 @@
-mod call;
-mod codec;
-mod config;
-mod rtp;
-mod sip;
-mod ws;
+use sipws::{config, sip};
 
 use std::sync::Arc;
 use std::time::Duration;
