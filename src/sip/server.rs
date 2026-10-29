@@ -622,6 +622,28 @@ impl SipServer {
     }
 
     /// Cleanup after the call task ends: BYE if needed, then forget the dialog.
+    /// Ends the SIP side of an answered call now (BYE in the background if needed), while
+    /// the call task may still be busy with the WebSocket (stt.finalize). Idempotent.
+    pub fn release_answered(self: &Arc<Self>, d: &Arc<Dialog>) {
+        let reason = d.end_reason().unwrap_or(EndReason::Error("unknown".into()));
+        {
+            let mut g = d.inner.lock().unwrap();
+            if g.state != InviteState::Answered {
+                return;
+            }
+            g.state = InviteState::Terminated;
+        }
+        d.cancel.cancel(); // stops 2xx retransmission
+        if reason.needs_bye() {
+            let (srv, d) = (self.clone(), d.clone());
+            tokio::spawn(async move {
+                if let Err(e) = srv.send_bye(&d).await {
+                    warn!(call_id = d.call_id, "BYE failed: {e:#}");
+                }
+            });
+        }
+    }
+
     async fn finish(&self, d: &Arc<Dialog>) {
         let reason = d.end_reason().unwrap_or(EndReason::Error("unknown".into()));
         let state = d.inner.lock().unwrap().state;

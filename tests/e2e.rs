@@ -96,6 +96,9 @@ struct AppLog {
     marks: Vec<Value>,
     results: Vec<Value>,
     end: Option<Value>,
+    barge_ins: Vec<Value>,
+    finalize: Option<Value>,
+    end_after_finalize: bool,
 }
 
 /// Echo app: returns every binary message as-is, drops a mark after 25 messages, hangs up after `hangup_after`.
@@ -137,6 +140,89 @@ async fn run_app(listener: TcpListener, hangup_after: usize, done: mpsc::Sender<
     let _ = done.send(log).await;
 }
 
+fn rpc(v: Value) -> Message {
+    Message::Text(v.to_string().into())
+}
+
+/// Scripted STT engine + bot (docs/stt-protocol.md). Timeline in 20 ms audio frames received:
+/// 10: bot plays 3 s of TTS + mark "tts"; 30: caller "speaks" over it (speech_started → barge-in);
+/// 32-38: partials, a final with words, then invalid messages; 40: call.transcript; 60: hangup.
+/// On stt.finalize it commits the still-open utterance u2 and answers.
+async fn run_stt_app(listener: TcpListener, ws_rate: u32, done: mpsc::Sender<AppLog>) {
+    let (tcp, _) = listener.accept().await.unwrap();
+    let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+    let (mut tx, mut rx) = ws.split();
+    let mut log = AppLog::default();
+    let script = |n: usize| -> Vec<Message> {
+        match n {
+            10 => {
+                let tone: Vec<u8> = (0..ws_rate * 3)
+                    .flat_map(|i| (((i as f64 * 2.0 * std::f64::consts::PI * 500.0 / ws_rate as f64).sin() * 12000.0) as i16).to_le_bytes())
+                    .collect();
+                vec![Message::Binary(tone.into()), rpc(json!({"jsonrpc":"2.0","method":"call.mark","params":{"name":"tts"}}))]
+            }
+            30 => vec![rpc(json!({"jsonrpc":"2.0","id":10,"method":"stt.speech_started","params":{"utterance_id":"u1","start_ms":560}}))],
+            32 => vec![
+                rpc(json!({"jsonrpc":"2.0","method":"stt.partial","params":{"utterance_id":"u1","seq":1,"text":"hel","stable_chars":2}})),
+                // Out of order, sent as a notification: dropped silently.
+                rpc(json!({"jsonrpc":"2.0","method":"stt.partial","params":{"utterance_id":"u1","seq":1,"text":"hello wor"}})),
+            ],
+            35 => vec![rpc(json!({"jsonrpc":"2.0","id":11,"method":"stt.final","params":{
+                "utterance_id":"u1","text":"hello world","start_ms":560,"end_ms":680,"confidence":0.91,"language":"en-US",
+                "words":[{"text":"hello","start_ms":560,"end_ms":600},{"text":"world","start_ms":600,"end_ms":680,"confidence":0.8}]}}))],
+            36 => vec![rpc(json!({"jsonrpc":"2.0","id":12,"method":"stt.final","params":{"utterance_id":"u1","text":"again","start_ms":560,"end_ms":680}}))],
+            37 => vec![rpc(json!({"jsonrpc":"2.0","id":13,"method":"stt.final","params":{"utterance_id":"u9","text":"future","start_ms":0,"end_ms":999_999}}))],
+            38 => vec![rpc(json!({"jsonrpc":"2.0","id":14,"method":"stt.partial","params":{"utterance_id":"u2","text":"and also","start_ms":700}}))],
+            40 => vec![rpc(json!({"jsonrpc":"2.0","id":15,"method":"call.transcript"}))],
+            45 => vec![rpc(json!({"jsonrpc":"2.0","id":16,"method":"stt.partial","params":{"utterance_id":"u3","text":"x","track":"bot"}}))],
+            60 => vec![rpc(json!({"jsonrpc":"2.0","id":2,"method":"call.hangup","params":{"reason":"done"}}))],
+            _ => vec![],
+        }
+    };
+    while let Some(Ok(m)) = rx.next().await {
+        match m {
+            Message::Binary(b) => {
+                log.binary_msgs += 1;
+                log.frame_sizes.push(b.len());
+                for out in script(log.binary_msgs) {
+                    let _ = tx.send(out).await;
+                }
+            }
+            Message::Text(t) => {
+                let v: Value = serde_json::from_str(&t).unwrap();
+                match v["method"].as_str() {
+                    Some("call.start") => log.start = Some(v["params"].clone()),
+                    Some("stt.begin") => {
+                        assert_eq!(v["params"]["protocol"], "sipws.stt/1");
+                        assert_eq!(v["params"]["languages"], json!(["ro-RO", "en-US"]));
+                        let _ = tx.send(rpc(json!({"jsonrpc":"2.0","id":v["id"],"result":{"engine":"scripted","features":{"interim_results":true}}}))).await;
+                    }
+                    Some("stt.finalize") => {
+                        log.finalize = Some(v["params"].clone());
+                        let _ = tx.send(rpc(json!({"jsonrpc":"2.0","method":"stt.final","params":{
+                            "utterance_id":"u2","text":"and also that","start_ms":700,"end_ms":900,"end_of_turn":true}}))).await;
+                        let _ = tx.send(rpc(json!({"jsonrpc":"2.0","id":v["id"],"result":{"utterances":2}}))).await;
+                    }
+                    Some("call.mark") => log.marks.push(v["params"].clone()),
+                    Some("call.barge_in") => log.barge_ins.push(v["params"].clone()),
+                    Some("call.dtmf") => {
+                        assert!(v["params"]["audio_ms"].as_u64().unwrap() > 0, "call.dtmf carries the audio clock");
+                        log.dtmf.push(v["params"]["digit"].as_str().unwrap().to_string());
+                    }
+                    Some("call.end") => {
+                        log.end_after_finalize = log.finalize.is_some();
+                        log.end = Some(v["params"].clone());
+                    }
+                    _ => log.results.push(v),
+                }
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+    let _ = done.send(log).await;
+}
+
 fn invite(sip: SocketAddr, uac: SocketAddr, rtp_port: u16, call_id: &str, sdp_media: &str) -> String {
     let sdp = format!(
         "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio {rtp_port} RTP/AVP {sdp_media}a=ptime:20\r\na=sendrecv\r\n"
@@ -160,6 +246,8 @@ struct Case {
     ogg: bool,
     /// Drop every 10th packet, swap every 7th with its successor, duplicate every 13th.
     impair: bool,
+    /// Use the scripted STT app instead of the echo app.
+    stt: bool,
 }
 
 struct Outcome {
@@ -172,7 +260,11 @@ async fn run_call(c: Case) -> Outcome {
     let ws_port = listener.local_addr().unwrap().port();
     let (done_tx, mut done_rx) = mpsc::channel(1);
     let hangup_after = if c.ogg { 102 } else { 100 };
-    tokio::spawn(run_app(listener, hangup_after, done_tx));
+    if c.stt {
+        tokio::spawn(run_stt_app(listener, c.ws_rate, done_tx));
+    } else {
+        tokio::spawn(run_app(listener, hangup_after, done_tx));
+    }
 
     let sip_port = free_udp_port();
     let url = format!("ws://127.0.0.1:{ws_port}/call/{{call_id}}");
@@ -313,9 +405,11 @@ To: {to}\r\nCall-ID: {call_id}\r\nCSeq: 1 ACK\r\nContent-Length: 0\r\n\r\n"
     let start = log.start.as_ref().expect("call.start");
     assert_eq!(start["call_id"], call_id);
     assert_eq!(start["sip_headers"]["X-Tenant"], "acme");
-    assert!(log.results.iter().any(|r| r["id"] == 1 && r["result"] == true), "{:?}", log.results);
     assert!(log.results.iter().any(|r| r["id"] == 2 && r["result"] == true));
-    assert_eq!(log.marks.first().map(|m| m["name"].clone()), Some(json!("m1")));
+    if !c.stt {
+        assert!(log.results.iter().any(|r| r["id"] == 1 && r["result"] == true), "{:?}", log.results);
+        assert_eq!(log.marks.first().map(|m| m["name"].clone()), Some(json!("m1")));
+    }
     assert_eq!(log.end.as_ref().expect("call.end")["reason"], "app_hangup:done");
     assert!(rx_packets > 50, "server must stream RTP");
     if pt == 0 {
@@ -383,7 +477,7 @@ fn check_ogg(o: &Outcome, name: &str) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn pcmu_call_with_16k_l16() {
-    let o = run_call(Case { name: "pcmu-l16", offer: "pcmu", server_codecs: "pcmu", ws_rate: 16000, rtp_base: 21000, extra: &[], ogg: false, impair: false }).await;
+    let o = run_call(Case { name: "pcmu-l16", offer: "pcmu", server_codecs: "pcmu", ws_rate: 16000, rtp_base: 21000, extra: &[], ogg: false, impair: false, stt: false }).await;
     check_l16(&o, 16000);
     let s = &o.log.end.as_ref().unwrap()["rtp"];
     assert_eq!((s["lost"].as_u64(), s["late"].as_u64()), (Some(0), Some(0)), "DTMF must not count as loss: {s}");
@@ -391,13 +485,13 @@ async fn pcmu_call_with_16k_l16() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn opus_call_with_48k_l16() {
-    let o = run_call(Case { name: "opus-l16", offer: "opus", server_codecs: "opus,pcmu", ws_rate: 48000, rtp_base: 22000, extra: &[], ogg: false, impair: false }).await;
+    let o = run_call(Case { name: "opus-l16", offer: "opus", server_codecs: "opus,pcmu", ws_rate: 48000, rtp_base: 22000, extra: &[], ogg: false, impair: false, stt: false }).await;
     check_l16(&o, 48000);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn jitter_buffer_handles_loss_reorder_duplicates() {
-    let o = run_call(Case { name: "pcmu-impaired", offer: "pcmu", server_codecs: "pcmu", ws_rate: 16000, rtp_base: 25000, extra: &[], ogg: false, impair: true }).await;
+    let o = run_call(Case { name: "pcmu-impaired", offer: "pcmu", server_codecs: "pcmu", ws_rate: 16000, rtp_base: 25000, extra: &[], ogg: false, impair: true, stt: false }).await;
     check_l16(&o, 16000);
     let s = &o.log.end.as_ref().unwrap()["rtp"];
     assert!(s["lost"].as_u64().unwrap() >= 5, "{s}");
@@ -407,7 +501,7 @@ async fn jitter_buffer_handles_loss_reorder_duplicates() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn opus_impaired_uses_fec() {
-    let o = run_call(Case { name: "opus-impaired", offer: "opus", server_codecs: "opus", ws_rate: 16000, rtp_base: 26000, extra: &[], ogg: false, impair: true }).await;
+    let o = run_call(Case { name: "opus-impaired", offer: "opus", server_codecs: "opus", ws_rate: 16000, rtp_base: 26000, extra: &[], ogg: false, impair: true, stt: false }).await;
     check_l16(&o, 16000);
     let s = &o.log.end.as_ref().unwrap()["rtp"];
     assert!(s["fec_available"].as_u64().unwrap() >= 5, "{s}");
@@ -418,7 +512,7 @@ async fn opus_impaired_uses_fec() {
 async fn opus_call_ogg_passthrough_both_ways() {
     let o = run_call(Case {
         name: "opus-ogg-pass", offer: "opus", server_codecs: "opus", ws_rate: 16000, rtp_base: 27000,
-        extra: &["--ws-out-format", "ogg-opus", "--ws-in-format", "ogg-opus"], ogg: true, impair: true,
+        extra: &["--ws-out-format", "ogg-opus", "--ws-in-format", "ogg-opus"], ogg: true, impair: true, stt: false,
     }).await;
     assert_eq!(o.log.start.as_ref().unwrap()["media"]["to_app"]["opus"], "passthrough");
     check_ogg(&o, "opus-ogg-pass");
@@ -428,10 +522,63 @@ async fn opus_call_ogg_passthrough_both_ways() {
 async fn pcmu_call_ogg_encoded_both_ways() {
     let o = run_call(Case {
         name: "pcmu-ogg-enc", offer: "pcmu", server_codecs: "pcmu", ws_rate: 16000, rtp_base: 28000,
-        extra: &["--ws-out-format", "ogg-opus", "--ws-in-format", "ogg-opus"], ogg: true, impair: false,
+        extra: &["--ws-out-format", "ogg-opus", "--ws-in-format", "ogg-opus"], ogg: true, impair: false, stt: false,
     }).await;
     assert_eq!(o.log.start.as_ref().unwrap()["media"]["to_app"]["opus"], "encoded");
     check_ogg(&o, "pcmu-ogg-enc");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stt_protocol_barge_in_finalize_and_transcript() {
+    let dir = std::env::temp_dir().join(format!("sipws-stt-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let dir_arg: &'static str = Box::leak(dir.to_string_lossy().to_string().into_boxed_str());
+    let extra: &'static [&'static str] = Box::leak(Box::new([
+        "--barge-in", "speech", "--stt-languages", "ro-RO,en-US", "--transcript-dir", dir_arg,
+    ]));
+    let o = run_call(Case { name: "stt", offer: "pcmu", server_codecs: "pcmu", ws_rate: 16000, rtp_base: 29000, extra, ogg: false, impair: false, stt: true }).await;
+    let log = &o.log;
+    let resp = |id: i64| log.results.iter().find(|r| r["id"] == id).unwrap_or_else(|| panic!("no response {id}: {:?}", log.results)).clone();
+
+    assert_eq!(resp(10)["result"], json!({"accepted": true, "utterance_id": "u1"}));
+    assert_eq!(resp(11)["result"]["accepted"], true);
+    assert_eq!(resp(12)["error"]["code"], -32010, "final twice");
+    assert_eq!(resp(13)["error"]["code"], -32012, "timestamp in the future");
+    assert_eq!(resp(13)["error"]["data"]["utterance_id"], "u9");
+    assert_eq!(resp(14)["result"]["accepted"], true);
+    assert_eq!(resp(16)["error"]["code"], -32014, "unknown track");
+    let tr = &resp(15)["result"];
+    assert_eq!(tr["open"], 1);
+    assert_eq!(tr["utterances"][0]["text"], "hello world");
+    assert_eq!(tr["utterances"][0]["words"][1]["confidence"], 0.8);
+    // Only requests get replies: the bad notification at frame 32 produced none.
+    assert_eq!(log.results.iter().filter(|r| r.get("error").is_some()).count(), 3, "{:?}", log.results);
+
+    // Barge-in at speech_started cut the 3 s of TTS and cleared its mark.
+    assert_eq!(log.barge_ins.len(), 1, "{:?}", log.barge_ins);
+    assert_eq!(log.barge_ins[0]["utterance_id"], "u1");
+    assert_eq!(log.barge_ins[0]["cleared_marks"], json!(["tts"]));
+    assert!(log.barge_ins[0]["cleared_samples"].as_u64().unwrap() > 16000, "{:?}", log.barge_ins);
+    assert!(log.marks.iter().any(|m| m["name"] == "tts" && m["cleared"] == true));
+    assert!((5..35).contains(&o.loud_packets), "caller heard {} loud packets; TTS must stop at barge-in", o.loud_packets);
+
+    // Finalize handshake ran before call.end.
+    assert_eq!(log.finalize.as_ref().expect("stt.finalize")["reason"], "app_hangup:done");
+    assert!(log.end_after_finalize);
+
+    let file = std::fs::read_to_string(dir.join("e2e-stt.jsonl")).unwrap();
+    let lines: Vec<Value> = file.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let dtmf: Vec<&Value> = lines.iter().filter(|l| l["type"] == "dtmf").collect();
+    assert_eq!(dtmf.len(), 1, "{file}");
+    assert_eq!(dtmf[0]["digit"], "5");
+    let lines: Vec<Value> = lines.into_iter().filter(|l| l["type"] != "dtmf").collect();
+    let kinds: Vec<&str> = lines.iter().map(|l| l["type"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["call", "stt.begin", "final", "final", "end"], "{file}");
+    assert_eq!(lines[0]["languages"], json!(["ro-RO", "en-US"]));
+    assert_eq!(lines[1]["engine"], "scripted");
+    assert_eq!((lines[2]["text"].as_str(), lines[3]["text"].as_str()), (Some("hello world"), Some("and also that")));
+    assert_eq!(lines[4]["reason"], "app_hangup:done");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]

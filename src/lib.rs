@@ -7,4 +7,6 @@ pub mod jitter;
 pub mod ogg;
 pub mod rtp;
 pub mod sip;
+pub mod stt;
+pub mod transcript;
 pub mod ws;

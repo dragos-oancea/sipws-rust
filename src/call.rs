@@ -27,6 +27,8 @@ use crate::rtp::{dtmf_char, dtmf_event, DtmfEvent, RtpPacket, RtpSocket};
 use crate::sip::message::{addr_uri, uri_user};
 use crate::sip::sdp::Negotiated;
 use crate::sip::server::{Dialog, EndReason, SipServer};
+use crate::stt::{self, Effect};
+use crate::transcript::{now_rfc3339, Transcript};
 use crate::ws::{self, Incoming};
 
 pub enum MediaCtl {
@@ -327,7 +329,7 @@ async fn bridge(
         Endian::Le => "little",
         Endian::Be => "big",
     };
-    let to_app_desc = match &to_app {
+    let to_app_desc: Value = match &to_app {
         ToApp::L16 { .. } => json!({
             "encoding": "L16", "sample_rate": pcm_rate, "channels": 1,
             "endianness": endianness, "frame_ms": cfg.ws_frame_ms,
@@ -353,7 +355,7 @@ async fn bridge(
                 "request_uri": req_uri,
                 "sip_headers": sip_headers,
                 "media": {
-                    "to_app": to_app_desc,
+                    "to_app": to_app_desc.clone(),
                     "from_app": from_app_desc,
                     "rtp_codec": neg.codec.name(),
                     "dtmf": neg.dtmf_pt.is_some(),
@@ -362,6 +364,43 @@ async fn bridge(
         ),
     )
     .await;
+
+    // STT handshake (docs/stt-protocol.md §3). Apps that don't do STT answer with an error.
+    let header_list = |name: &str, default: &[String]| -> Vec<String> {
+        match inv.header(name) {
+            Some(v) => v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+            None => default.to_vec(),
+        }
+    };
+    let stt_languages = header_list("X-STT-Language", &cfg.stt_languages);
+    let mut stt = SttState {
+        session: stt::Session::new(cfg.barge_in, cfg.barge_in_min_chars),
+        lines: Vec::new(),
+        finalize_done: false,
+    };
+    if cfg.stt {
+        send_ctl(
+            &ws_tx,
+            ws::request(
+                stt::BEGIN_ID,
+                "stt.begin",
+                json!({
+                    "protocol": stt::PROTOCOL,
+                    "call_id": d.call_id,
+                    "tracks": ["caller"],
+                    "audio": to_app_desc,
+                    "languages": stt_languages,
+                    "interim_results": cfg.stt_interim,
+                    "word_timestamps": cfg.stt_words,
+                    "max_alternatives": cfg.stt_max_alternatives,
+                    "hints": header_list("X-STT-Hints", &cfg.stt_hints),
+                }),
+            ),
+        )
+        .await;
+    } else {
+        stt.session.state = stt::State::Inactive;
+    }
 
     // Ogg streams start with OpusHead + OpusTags pages, each its own binary message.
     let comments = vec![format!("SIPWS_CALL_ID={}", d.call_id), format!("SIPWS_FROM={from_uri}"), format!("SIPWS_TO={to_uri}")];
@@ -383,10 +422,15 @@ async fn bridge(
 
     // 3. Answer the SIP leg.
     if !server.answer(d, answer_sdp).await {
-        finish_ws(&ws_tx, writer, &mut ws_rx, d, &mut to_app, Value::Null).await;
+        finish_ws(&ws_tx, writer, &mut ws_rx, d, &mut to_app, Value::Null, true).await;
         return Ok(());
     }
     info!(call_id = d.call_id, codec = neg.codec.name(), to_app = cfg.ws_out_format.name(), "call answered");
+    let mut transcript = Transcript::open(cfg.transcript_dir.as_deref(), &d.call_id).await;
+    transcript
+        .write(&json!({"type": "call", "call_id": d.call_id, "from": from_uri, "to": to_uri,
+            "answered_at": now_rfc3339(), "languages": stt_languages}))
+        .await;
 
     // 4. Media loop.
     let dur_of: fn(&[u8]) -> Option<u32> = match neg.codec {
@@ -415,6 +459,9 @@ async fn bridge(
     let mut dtmf_rx = DtmfRx::default();
     let mut last_rtp = Instant::now();
     let mut dropped_frames: u64 = 0;
+    // The audio clock (docs/stt-protocol.md §2.1): RTP clock units of audio handed to the app.
+    let mut sent_clock: u64 = 0;
+    let audio_ms = |sent: u64| sent * 1000 / clock as u64;
 
     let mut play = Playout {
         buf: VecDeque::new(),
@@ -439,9 +486,16 @@ async fn bridge(
                     play.push(&in_pcm);
                 }
                 Some(Ok(Message::Text(text))) => {
-                    let jb_stats = serde_json::to_value(&jb.stats).unwrap_or_default();
-                    for reply in handle_rpc(&text, d, &mut play, &mut dtmf, &neg, clock, jb_stats) {
+                    let mut ctx = RpcCtx {
+                        d, play: &mut play, dtmf: &mut dtmf, neg: &neg, clock,
+                        jb_stats: serde_json::to_value(&jb.stats).unwrap_or_default(),
+                        stt: &mut stt, audio_ms: audio_ms(sent_clock),
+                    };
+                    for reply in handle_rpc(&text, &mut ctx) {
                         send_ctl(&ws_tx, reply).await;
+                    }
+                    for line in stt.lines.drain(..) {
+                        transcript.write(&line).await;
                     }
                 }
                 Some(Ok(Message::Close(_))) | None => {
@@ -483,8 +537,10 @@ async fn bridge(
                     for (event, dur) in dtmf_rx.on_packet(pkt.ts, ev) {
                         if let Some(digit) = dtmf_char(event) {
                             let ms = dur as u32 * 1000 / clock;
+                            let at = audio_ms(sent_clock);
                             send_ctl(&ws_tx, ws::notification("call.dtmf",
-                                json!({"digit": digit.to_string(), "duration_ms": ms, "source": "rfc4733"}))).await;
+                                json!({"digit": digit.to_string(), "duration_ms": ms, "source": "rfc4733", "audio_ms": at}))).await;
+                            transcript.write(&json!({"type": "dtmf", "digit": digit.to_string(), "audio_ms": at})).await;
                         }
                     }
                 }
@@ -513,6 +569,7 @@ async fn bridge(
                 while rx_budget > 0 {
                     let item = jb.pop(now, rx_budget as u32).unwrap_or(JbItem::Silence { dur: rx_budget as u32 });
                     rx_budget -= item.dur() as i64;
+                    sent_clock += item.dur() as u64;
                     to_app.feed(item, &mut tc, clock, &mut out_msgs);
                 }
                 for m in out_msgs.drain(..) {
@@ -535,7 +592,8 @@ async fn bridge(
                 ts = ts.wrapping_add(ts_step);
 
                 for name in play.due_marks() {
-                    send_ctl(&ws_tx, ws::notification("call.mark", json!({"name": name, "cleared": false}))).await;
+                    send_ctl(&ws_tx, ws::notification("call.mark",
+                        json!({"name": name, "cleared": false, "audio_ms": audio_ms(sent_clock)}))).await;
                 }
             },
 
@@ -550,16 +608,62 @@ async fn bridge(
                     last_rtp = Instant::now();
                 }
                 MediaCtl::Dtmf { digit, duration_ms } => {
+                    let at = audio_ms(sent_clock);
                     send_ctl(&ws_tx, ws::notification("call.dtmf",
-                        json!({"digit": digit.to_string(), "duration_ms": duration_ms, "source": "sip_info"}))).await;
+                        json!({"digit": digit.to_string(), "duration_ms": duration_ms, "source": "sip_info", "audio_ms": at}))).await;
+                    transcript.write(&json!({"type": "dtmf", "digit": digit.to_string(), "audio_ms": at})).await;
                 }
             },
         }
     }
 
+    // Media is over: hang up the SIP leg right away, then give the STT engine its grace period.
+    server.release_answered(d);
+    let reason = d.end_reason().map(|r| r.as_str()).unwrap_or_else(|| "unknown".into());
+    let end_ms = audio_ms(sent_clock);
+    let mut ws_alive = d.end_reason() != Some(EndReason::WsClosed);
+
+    if ws_alive && stt.session.state == stt::State::Active && cfg.stt_finalize_ms > 0 {
+        send_ctl(&ws_tx, ws::request(stt::FINALIZE_ID, "stt.finalize", json!({"reason": reason, "audio_ms": end_ms}))).await;
+        let deadline = tokio::time::sleep(Duration::from_millis(cfg.stt_finalize_ms));
+        tokio::pin!(deadline);
+        while !stt.finalize_done {
+            tokio::select! {
+                _ = &mut deadline => {
+                    info!(call_id = d.call_id, "stt.finalize: no answer within {} ms", cfg.stt_finalize_ms);
+                    break;
+                }
+                msg = ws_rx.next() => match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        let mut ctx = RpcCtx {
+                            d, play: &mut play, dtmf: &mut dtmf, neg: &neg, clock,
+                            jb_stats: serde_json::to_value(&jb.stats).unwrap_or_default(),
+                            stt: &mut stt, audio_ms: end_ms,
+                        };
+                        for reply in handle_rpc(&text, &mut ctx) {
+                            send_ctl(&ws_tx, reply).await;
+                        }
+                        for line in stt.lines.drain(..) {
+                            transcript.write(&line).await;
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
+                        ws_alive = false;
+                        break;
+                    }
+                    Some(Ok(_)) => {} // audio after hangup is dropped
+                },
+            }
+        }
+    }
+    for line in stt.session.abandon_all() {
+        transcript.write(&line).await;
+    }
+    transcript.write(&json!({"type": "end", "reason": reason, "audio_ms": end_ms, "ended_at": now_rfc3339()})).await;
+
     let stats = serde_json::to_value(&jb.stats).unwrap_or_default();
     info!(call_id = d.call_id, rtp = %stats, "media stats");
-    finish_ws(&ws_tx, writer, &mut ws_rx, d, &mut to_app, stats).await;
+    finish_ws(&ws_tx, writer, &mut ws_rx, d, &mut to_app, stats, ws_alive).await;
     Ok(())
 }
 
@@ -633,9 +737,10 @@ async fn finish_ws(
     d: &Dialog,
     to_app: &mut ToApp,
     rtp_stats: Value,
+    ws_alive: bool,
 ) {
     let reason = d.end_reason().map(|r| r.as_str()).unwrap_or_else(|| "unknown".into());
-    if d.end_reason() != Some(EndReason::WsClosed) {
+    if ws_alive && d.end_reason() != Some(EndReason::WsClosed) {
         // Close the Ogg stream properly (EOS page) before the call.end notification.
         if let Some(page) = to_app.finish() {
             send_ctl(ws_tx, Message::Binary(page.into())).await;
@@ -657,39 +762,134 @@ async fn finish_ws(
     let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
 }
 
-fn handle_rpc(
-    text: &str,
-    d: &Dialog,
-    play: &mut Playout,
-    dtmf: &mut DtmfTx,
-    neg: &Negotiated,
+/// STT state owned by the call task.
+struct SttState {
+    session: stt::Session,
+    /// Transcript lines produced while handling a message; written by the caller (async).
+    lines: Vec<Value>,
+    finalize_done: bool,
+}
+
+struct RpcCtx<'a> {
+    d: &'a Dialog,
+    play: &'a mut Playout,
+    dtmf: &'a mut DtmfTx,
+    neg: &'a Negotiated,
     clock: u32,
     jb_stats: Value,
-) -> Vec<Message> {
+    stt: &'a mut SttState,
+    audio_ms: u64,
+}
+
+/// Flushes queued playout; returns (samples, cleared marks) and queues cleared-mark notifications.
+fn clear_playout(play: &mut Playout, audio_ms: u64, out: &mut Vec<Message>) -> (usize, Vec<String>) {
+    let samples = play.clear();
+    let cleared: Vec<String> = play.marks.drain(..).map(|(_, n)| n).collect();
+    for name in &cleared {
+        out.push(ws::notification("call.mark", json!({"name": name, "cleared": true, "audio_ms": audio_ms})));
+    }
+    (samples, cleared)
+}
+
+fn handle_response(id: &Value, result: Result<Value, Value>, ctx: &mut RpcCtx) {
+    let st = &mut ctx.stt;
+    match (id.as_str(), result) {
+        (Some(stt::BEGIN_ID), Ok(r)) => {
+            if st.session.state != stt::State::Failed {
+                st.session.state = stt::State::Active;
+            }
+            let engine = r.get("engine").cloned().unwrap_or_default();
+            info!(call_id = ctx.d.call_id, %engine, "STT session active");
+            let mut line = json!({"type": "stt.begin"});
+            for k in ["engine", "languages", "features"] {
+                if let Some(v) = r.get(k) {
+                    line[k] = v.clone();
+                }
+            }
+            st.lines.push(line);
+        }
+        (Some(stt::BEGIN_ID), Err(e)) => {
+            if st.session.state == stt::State::Pending {
+                st.session.state = stt::State::Inactive;
+            }
+            debug!(call_id = ctx.d.call_id, error = %e, "app declined stt.begin");
+        }
+        (Some(stt::FINALIZE_ID), r) => {
+            if let Err(e) = r {
+                debug!(call_id = ctx.d.call_id, error = %e, "stt.finalize error");
+            }
+            st.finalize_done = true;
+        }
+        _ => {}
+    }
+}
+
+fn handle_rpc(text: &str, ctx: &mut RpcCtx) -> Vec<Message> {
     let (id, method, params) = match ws::parse_rpc(text) {
         Incoming::Call { id, method, params } => (id, method, params),
-        Incoming::Response => return vec![],
+        Incoming::Response { id, result } => {
+            handle_response(&id, result, ctx);
+            return vec![];
+        }
         Incoming::Invalid { id, code, message } => return vec![ws::error(id, code, &message)],
     };
     let mut out = Vec::new();
+
+    // Speech-to-text results (docs/stt-protocol.md §4).
+    if let Some(r) = ctx.stt.session.handle(&method, &params, ctx.audio_ms) {
+        match r {
+            Ok((result, effects)) => {
+                for fx in effects {
+                    match fx {
+                        Effect::BargeIn { utterance_id } => {
+                            if !ctx.play.buf.is_empty() {
+                                let mut notes = Vec::new();
+                                let (samples, marks) = clear_playout(ctx.play, ctx.audio_ms, &mut notes);
+                                info!(call_id = ctx.d.call_id, utterance_id, samples, "barge-in");
+                                out.extend(notes);
+                                out.push(ws::notification("call.barge_in", json!({
+                                    "utterance_id": utterance_id, "audio_ms": ctx.audio_ms,
+                                    "cleared_samples": samples, "cleared_marks": marks,
+                                })));
+                            }
+                        }
+                        Effect::Record(line) => ctx.stt.lines.push(line),
+                        Effect::Final { utterance_id, text, end_of_turn } => {
+                            info!(call_id = ctx.d.call_id, utterance_id, end_of_turn, text = %text, "transcript");
+                        }
+                        Effect::EngineError { code, message, fatal } => {
+                            warn!(call_id = ctx.d.call_id, code, message, fatal, "STT engine error");
+                        }
+                    }
+                }
+                if let Some(id) = id {
+                    out.insert(0, ws::result(id, result));
+                }
+            }
+            Err(e) => {
+                debug!(call_id = ctx.d.call_id, method, code = e.code, message = e.message, "rejected STT message");
+                if let Some(id) = id {
+                    out.push(ws::error_data(id, e.code, &e.message, e.data));
+                }
+            }
+        }
+        return out;
+    }
+
     let outcome: Result<Value, (i64, String)> = match method.as_str() {
         "call.hangup" => {
             let reason = params.get("reason").and_then(Value::as_str).unwrap_or("").to_string();
-            d.terminate(EndReason::AppHangup(reason));
+            ctx.d.terminate(EndReason::AppHangup(reason));
             Ok(json!(true))
         }
         "call.clear" => {
-            let samples = play.clear();
             // Pending marks are reported back as cleared, so the app can track what was cut.
-            let cleared: Vec<String> = play.marks.drain(..).map(|(_, n)| n).collect();
-            for name in &cleared {
-                out.push(ws::notification("call.mark", json!({"name": name, "cleared": true})));
-            }
+            let (samples, cleared) = clear_playout(ctx.play, ctx.audio_ms, &mut out);
             Ok(json!({"cleared_samples": samples, "cleared_marks": cleared}))
         }
         "call.mark" => match params.get("name").and_then(Value::as_str) {
             Some(name) => {
-                play.marks.push_back((play.enqueued, name.to_string()));
+                ctx.play.marks.push_back((ctx.play.enqueued, name.to_string()));
                 Ok(json!(true))
             }
             None => Err((ws::INVALID_PARAMS, "params.name (string) required".into())),
@@ -697,24 +897,30 @@ fn handle_rpc(
         "call.dtmf" => {
             let digits = params.get("digits").and_then(Value::as_str).unwrap_or("");
             let ms = params.get("duration_ms").and_then(Value::as_u64).unwrap_or(100).clamp(40, 2000) as u32;
-            if neg.dtmf_pt.is_none() {
+            if ctx.neg.dtmf_pt.is_none() {
                 Err((ws::SERVER_ERROR, "telephone-event not negotiated on this call".into()))
             } else if digits.is_empty() || !digits.chars().all(|c| dtmf_event(c).is_some()) {
                 Err((ws::INVALID_PARAMS, "params.digits must be non-empty and contain 0-9*#A-D".into()))
             } else {
                 for c in digits.chars() {
-                    dtmf.queue.push_back((dtmf_event(c).unwrap(), ms * clock / 1000));
+                    ctx.dtmf.queue.push_back((dtmf_event(c).unwrap(), ms * ctx.clock / 1000));
                 }
                 Ok(json!({"queued": digits.len()}))
             }
         }
         "call.status" => Ok(json!({
-            "call_id": d.call_id,
-            "codec": neg.codec.name(),
-            "buffered_samples": play.buf.len(),
-            "pending_marks": play.marks.len(),
-            "rtp": jb_stats,
+            "call_id": ctx.d.call_id,
+            "codec": ctx.neg.codec.name(),
+            "audio_ms": ctx.audio_ms,
+            "buffered_samples": ctx.play.buf.len(),
+            "pending_marks": ctx.play.marks.len(),
+            "stt": match ctx.stt.session.state {
+                stt::State::Pending => "pending", stt::State::Active => "active",
+                stt::State::Inactive => "inactive", stt::State::Failed => "failed",
+            },
+            "rtp": ctx.jb_stats,
         })),
+        "call.transcript" => Ok(ctx.stt.session.transcript()),
         "ping" | "call.ping" => Ok(json!("pong")),
         _ => Err((ws::METHOD_NOT_FOUND, format!("unknown method {method}"))),
     };

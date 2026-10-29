@@ -79,9 +79,19 @@ pub fn result(id: Value, result: Value) -> Message {
 }
 
 pub fn error(id: Value, code: i64, message: &str) -> Message {
-    Message::Text(
-        json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}).to_string().into(),
-    )
+    error_data(id, code, message, Value::Null)
+}
+
+pub fn error_data(id: Value, code: i64, message: &str, data: Value) -> Message {
+    let mut e = json!({"code": code, "message": message});
+    if !data.is_null() {
+        e["data"] = data;
+    }
+    Message::Text(json!({"jsonrpc": "2.0", "id": id, "error": e}).to_string().into())
+}
+
+pub fn request(id: &str, method: &str, params: Value) -> Message {
+    Message::Text(json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string().into())
 }
 
 pub const PARSE_ERROR: i64 = -32700;
@@ -94,8 +104,8 @@ pub const SERVER_ERROR: i64 = -32000;
 pub enum Incoming {
     /// Request (id is Some) or notification (id is None).
     Call { id: Option<Value>, method: String, params: Value },
-    /// A response to something we sent; we send only notifications, so these are ignored.
-    Response,
+    /// A response to a request we sent (stt.begin, stt.finalize).
+    Response { id: Value, result: Result<Value, Value> },
     Invalid { id: Value, code: i64, message: String },
 }
 
@@ -111,7 +121,13 @@ pub fn parse_rpc(text: &str) -> Incoming {
             method: m.to_string(),
             params: v.get("params").cloned().unwrap_or(Value::Null),
         },
-        None if v.get("result").is_some() || v.get("error").is_some() => Incoming::Response,
+        None if v.get("result").is_some() || v.get("error").is_some() => Incoming::Response {
+            id: id.unwrap_or(Value::Null),
+            result: match v.get("error") {
+                Some(e) if !e.is_null() => Err(e.clone()),
+                _ => Ok(v.get("result").cloned().unwrap_or(Value::Null)),
+            },
+        },
         None => Incoming::Invalid {
             id: id.unwrap_or(Value::Null),
             code: INVALID_REQUEST,
@@ -177,7 +193,11 @@ mod tests {
     #[test]
     fn rpc_parsing() {
         assert!(matches!(parse_rpc("{"), Incoming::Invalid { code: PARSE_ERROR, .. }));
-        assert!(matches!(parse_rpc(r#"{"jsonrpc":"2.0","id":1,"result":true}"#), Incoming::Response));
+        assert!(matches!(parse_rpc(r#"{"jsonrpc":"2.0","id":1,"result":true}"#), Incoming::Response { result: Ok(_), .. }));
+        match parse_rpc(r#"{"jsonrpc":"2.0","id":"stt-begin","error":{"code":-32601,"message":"x"}}"#) {
+            Incoming::Response { id, result: Err(e) } => assert!(id == "stt-begin" && e["code"] == -32601),
+            _ => panic!(),
+        }
         match parse_rpc(r#"{"jsonrpc":"2.0","method":"call.clear"}"#) {
             Incoming::Call { id, method, .. } => assert!(id.is_none() && method == "call.clear"),
             _ => panic!(),

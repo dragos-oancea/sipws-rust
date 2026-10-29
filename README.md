@@ -4,7 +4,8 @@ A SIP/RTP media server in Rust that bridges every inbound call to a WebSocket.
 The SIP leg speaks Opus, PCMU or PCMA over RTP through an adaptive jitter
 buffer; the WebSocket leg carries JSON-RPC 2.0 control messages on text frames
 and audio on binary frames, in both directions, as either **raw L16 mono PCM**
-or an **Ogg/Opus stream** (RFC 7845).
+or an **Ogg/Opus stream** (RFC 7845). Speech-to-text results come back on the same
+WebSocket through the JSON-RPC protocol [`sipws.stt/1`](docs/stt-protocol.md).
 
 ```
  SIP trunk / PBX / softphone                       your app (bot, ASR/TTS, recorder…)
@@ -58,6 +59,14 @@ All options also work as environment variables (`SIPWS_*`), see `sipws --help`.
 | `--symmetric-rtp` | true | Latch RTP to the source address (NAT) |
 | `--forward-headers` | `X-,P-Asserted-Identity,Diversion` | INVITE headers copied into `call.start` |
 | `--max-calls` | 500 | Beyond this, `486 Busy Here` |
+| `--stt` | true | Send the `stt.begin` handshake on every call |
+| `--stt-languages` | — | BCP-47 list, e.g. `ro-RO,en-US`; per call: `X-STT-Language` header |
+| `--stt-hints` | — | Phrase hints; per call: `X-STT-Hints` header |
+| `--stt-interim`, `--stt-words`, `--stt-max-alternatives` | true, false, 1 | What `stt.begin` asks the engine for |
+| `--stt-finalize-ms` | 1500 | Grace period for the engine at hangup (0 = none) |
+| `--barge-in` | `off` | `speech` or `partial`: cut the bot's audio when the caller talks |
+| `--barge-in-min-chars` | 2 | Minimum non-space characters for `--barge-in partial` |
+| `--transcript-dir` | — | Write `<call_id>.jsonl` transcripts here |
 
 ## Call flow
 
@@ -67,6 +76,9 @@ All options also work as environment variables (`SIPWS_*`), see `sipws --help`.
 4. Audio flows both ways until either side hangs up. A caller BYE / CANCEL, app
    `call.hangup`, WebSocket close, RTP timeout or missing ACK all end the call;
    sipws sends BYE whenever the caller doesn't already know.
+5. The SIP leg is released as soon as media stops. If an STT session is active, sipws then
+   sends `stt.finalize` and waits up to `--stt-finalize-ms` for the last results before the final Ogg page,
+   `call.end`, and the WebSocket close.
 
 ## WebSocket protocol
 
@@ -116,8 +128,9 @@ Notifications from sipws:
 | method | params |
 |---|---|
 | `call.start` | `call_id, from, to, request_uri, sip_headers{}, media{to_app{…}, from_app{…}, rtp_codec, dtmf}`. `to_app` is `{encoding:"L16", sample_rate, channels, endianness, frame_ms}` or `{encoding:"ogg/opus", sample_rate:48000, channels, page_ms, opus:"passthrough"\|"encoded", serial}` |
-| `call.dtmf` | `digit, duration_ms, source` (`rfc4733` or `sip_info`) |
-| `call.mark` | `name, cleared` — a mark's audio finished playing (`cleared:true` if dropped by `call.clear`) |
+| `call.dtmf` | `digit, duration_ms, source` (`rfc4733` or `sip_info`), `audio_ms` |
+| `call.mark` | `name, cleared, audio_ms`. A mark's audio finished playing (`cleared:true` if it was dropped by `call.clear` or barge-in) |
+| `call.barge_in` | `utterance_id, audio_ms, cleared_samples, cleared_marks[]`. Caller speech cut the bot's audio (`--barge-in`) |
 | `call.end` | `call_id, reason, rtp{…jitter-buffer stats}`. `reason` is one of `remote_hangup`, `cancelled`, `app_hangup[:reason]`, `rtp_timeout`, `ack_timeout`, `shutdown`, `error:…` |
 
 Methods the app can call (send with an `id` to get a response, or without for fire-and-forget):
@@ -128,10 +141,47 @@ Methods the app can call (send with an `id` to get a response, or without for fi
 | `call.clear` | — | `{cleared_samples, cleared_marks[]}`; flushes queued playback (barge-in) |
 | `call.mark` | `name` | `true`; `call.mark` fires when everything queued before it has played |
 | `call.dtmf` | `digits`, `duration_ms?` (default 100) | `{queued}`; RFC 4733 to the caller; error if telephone-event wasn't negotiated |
-| `call.status` | — | `{call_id, codec, buffered_samples, pending_marks, rtp{received, played, lost, fec_available, late, duplicate, underruns, overflow_dropped, resets, depth_ms}}` |
+| `call.status` | — | `{call_id, codec, audio_ms, buffered_samples, pending_marks, stt:"pending"\|"active"\|"inactive"\|"failed", rtp{received, played, lost, fec_available, late, duplicate, underruns, overflow_dropped, resets, depth_ms}}` |
+| `call.transcript` | — | `{utterances[…finals by start_ms], open}` |
 | `ping` | — | `"pong"` |
 
 Errors use the standard codes (`-32700` parse, `-32601` unknown method, `-32602` bad params, `-32000` call-level).
+
+`audio_ms` is the **audio clock**: milliseconds of audio sipws has sent to the app so far. Speech-to-text
+results use the same clock.
+
+### Speech-to-text: `sipws.stt/1`
+
+Recognised text comes back over the same WebSocket as JSON-RPC. **The full spec is in
+[docs/stt-protocol.md](docs/stt-protocol.md).** In short:
+
+* **Handshake.** sipws → `stt.begin` (a request carrying audio format, languages, hints and wanted
+  features). The engine answers with its capabilities. An error or no answer means the app doesn't do STT.
+* **Results.** Engine → sipws, each sent as a notification or as a request (requests are acked or rejected):
+  * `stt.speech_started {utterance_id, start_ms}`
+  * `stt.partial {utterance_id, seq?, text, stable_chars?, …}`. Each partial replaces the previous hypothesis.
+  * `stt.final {utterance_id, text, start_ms, end_ms, confidence?, language?, end_of_turn, words?, alternatives?}`. Exactly one per utterance.
+  * `stt.speech_ended {utterance_id, end_ms}`
+  * `stt.error {code, message, fatal}`
+* **Validation.** sipws enforces the utterance lifecycle and limits. Rejections carry their own codes: `-32010` already final,
+  `-32011` out of order, `-32012` timestamp past the audio sent, `-32013` too many open, `-32014` unknown track.
+* **Teardown.** sipws → `stt.finalize`. The engine flushes its open utterances and answers.
+* **Barge-in.** `--barge-in speech|partial` cuts queued bot audio at the caller's first speech, without a round trip.
+* **Transcript.** `call.transcript` returns the finals so far. `--transcript-dir` writes JSONL with call metadata,
+  finals, DTMF, engine errors, abandoned utterances and the end reason.
+
+```json
+← {"jsonrpc":"2.0","id":"stt-begin","method":"stt.begin","params":{"protocol":"sipws.stt/1","call_id":"a84b4c76","tracks":["caller"],"audio":{…},"languages":["ro-RO"],"interim_results":true,"word_timestamps":false,"max_alternatives":1,"hints":[]}}
+→ {"jsonrpc":"2.0","id":"stt-begin","result":{"engine":"deepgram-nova-3"}}
+→ {"jsonrpc":"2.0","method":"stt.speech_started","params":{"utterance_id":"u1","start_ms":820}}
+← {"jsonrpc":"2.0","method":"call.barge_in","params":{"utterance_id":"u1","audio_ms":840,"cleared_samples":22400,"cleared_marks":["greeting"]}}
+→ {"jsonrpc":"2.0","method":"stt.partial","params":{"utterance_id":"u1","seq":1,"text":"bună"}}
+→ {"jsonrpc":"2.0","id":5,"method":"stt.final","params":{"utterance_id":"u1","text":"Bună ziua.","start_ms":820,"end_ms":1610,"confidence":0.98,"end_of_turn":true}}
+← {"jsonrpc":"2.0","id":5,"result":{"accepted":true,"utterance_id":"u1"}}
+```
+
+`cargo run --example stt_mock` is a VAD-based mock engine that speaks the protocol (it detects speech but doesn't transcribe it), for trying barge-in
+and transcripts with a softphone.
 
 Example session:
 
@@ -192,6 +242,7 @@ Unit tests cover:
 
 * the SIP parser, SDP negotiation, G.711, the resampler and RTP/DTMF;
 * the jitter buffer: reorder, loss + FEC hints, multi-packet holes, DTX, wraparound, SSRC reset, overflow and telephone-event slots;
+* the STT session: lifecycle, every validation rule and error code, the open-utterance limit, barge-in modes and fatal errors;
 * the Ogg muxer/demuxer: lacing, page splitting, chunked input, CRC resync and chained streams, plus reading an Ogg/Opus file produced by ffmpeg/libopus.
 
 `tests/e2e.rs` starts the real binary and drives full calls with a scripted SIP UAC and an in-process
@@ -201,4 +252,11 @@ WebSocket echo app. Every call runs INVITE → 200 → ACK, gets the caller's to
 * PCMU and Opus with L16 at 16 and 48 kHz. RFC 4733 DTMF must not register as loss.
 * An impaired network (10% loss, reordering, duplicates). Measured: lost = exactly the dropped packets, late = 0, and the duplicates and FEC are detected.
 * Ogg/Opus both ways, in passthrough (impaired Opus call) and encoded (PCMU call). The app echoes the Ogg bytes back. The stream is checked with our demuxer (CRC, page per message, granule = sample count). When installed, **ffprobe/ffmpeg** must decode it cleanly with the expected duration.
+* The STT protocol, with a scripted engine and bot:
+  * the handshake and language hints;
+  * barge-in cutting 3 s of TTS (the caller hears it stop), with its mark reported as cleared;
+  * partials, a final with words, and invalid results rejected with the right codes;
+  * `call.transcript`;
+  * `stt.finalize` delivering the last utterance before `call.end`;
+  * the JSONL transcript file contents.
 * 503 when the WebSocket is unreachable, and 488 for a codec mismatch.

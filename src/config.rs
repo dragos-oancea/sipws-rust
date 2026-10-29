@@ -129,6 +129,45 @@ pub struct Config {
     /// Maximum concurrent calls; further INVITEs get 486 Busy Here.
     #[arg(long, env = "SIPWS_MAX_CALLS", default_value_t = 500)]
     pub max_calls: usize,
+
+    /// Send the stt.begin handshake (docs/stt-protocol.md) to the app on every call.
+    #[arg(long, env = "SIPWS_STT", default_value_t = true, action = clap::ArgAction::Set)]
+    pub stt: bool,
+
+    /// Recognition languages (BCP-47) in preference order. Per call: SIP header X-STT-Language.
+    #[arg(long, env = "SIPWS_STT_LANGUAGES", value_delimiter = ',')]
+    pub stt_languages: Vec<String>,
+
+    /// Phrase hints for the engine. Per call: SIP header X-STT-Hints.
+    #[arg(long, env = "SIPWS_STT_HINTS", value_delimiter = ',')]
+    pub stt_hints: Vec<String>,
+
+    /// Ask the engine for interim results (stt.partial).
+    #[arg(long, env = "SIPWS_STT_INTERIM", default_value_t = true, action = clap::ArgAction::Set)]
+    pub stt_interim: bool,
+
+    /// Ask the engine for word timestamps on finals.
+    #[arg(long, env = "SIPWS_STT_WORDS", default_value_t = false, action = clap::ArgAction::Set)]
+    pub stt_words: bool,
+
+    #[arg(long, env = "SIPWS_STT_MAX_ALTERNATIVES", default_value_t = 1)]
+    pub stt_max_alternatives: u32,
+
+    /// At hangup, how long to wait for the engine to answer stt.finalize (0 = don't wait).
+    #[arg(long, env = "SIPWS_STT_FINALIZE_MS", default_value_t = 1500)]
+    pub stt_finalize_ms: u64,
+
+    /// Cut the bot's queued audio when the caller starts speaking.
+    #[arg(long, env = "SIPWS_BARGE_IN", value_enum, default_value_t = crate::stt::BargeIn::Off)]
+    pub barge_in: crate::stt::BargeIn,
+
+    /// For --barge-in partial: non-space characters a hypothesis needs before it counts.
+    #[arg(long, env = "SIPWS_BARGE_IN_MIN_CHARS", default_value_t = 2)]
+    pub barge_in_min_chars: usize,
+
+    /// Write one JSONL transcript per call into this directory.
+    #[arg(long, env = "SIPWS_TRANSCRIPT_DIR")]
+    pub transcript_dir: Option<std::path::PathBuf>,
 }
 
 impl Config {
@@ -147,6 +186,12 @@ impl Config {
         }
         if !(6000..=510_000).contains(&self.ogg_bitrate) {
             bail!("--ogg-bitrate must be 6000..=510000");
+        }
+        if self.stt_finalize_ms > 30_000 || !(1..=10).contains(&self.stt_max_alternatives) {
+            bail!("--stt-finalize-ms must be <= 30000 and --stt-max-alternatives 1..=10");
+        }
+        if let Some(dir) = &self.transcript_dir {
+            std::fs::create_dir_all(dir)?;
         }
         if self.rtp_port_min >= self.rtp_port_max {
             bail!("empty RTP port range");
